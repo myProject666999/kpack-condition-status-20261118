@@ -283,6 +283,38 @@ func testBuildReconciler(t *testing.T, when spec.G, it spec.S) {
 			})
 		})
 
+		it("never writes status for a finished build across repeated reconciles", func() {
+			buildPod, err := podGenerator.Generate(ctx, bld)
+			require.NoError(t, err)
+
+			finishedBuild := bld.DeepCopy()
+			finishedBuild.Status = buildapi.BuildStatus{
+				Status: corev1alpha1.Status{
+					ObservedGeneration: 1,
+					Conditions: corev1alpha1.Conditions{
+						{
+							Type:   corev1alpha1.ConditionSucceeded,
+							Status: corev1.ConditionTrue,
+							Reason: build.ReasonCompleted,
+						},
+					},
+				},
+				PodName: buildPod.Name,
+			}
+
+			for i := 0; i < 10; i++ {
+				rt.Test(rtesting.TableRow{
+					Key: key,
+					Objects: []runtime.Object{
+						finishedBuild,
+						buildPod,
+					},
+					WantErr: false,
+					// No WantStatusUpdates: a finished build must produce no write.
+				})
+			}
+		})
+
 		it("saves error creating build to status", func() {
 			podGenerator.returnErr = errors.New("display me in the status")
 

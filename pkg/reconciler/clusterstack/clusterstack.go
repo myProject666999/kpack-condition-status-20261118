@@ -5,9 +5,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"go.uber.org/zap"
-	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging/logkey"
@@ -18,6 +16,7 @@ import (
 	buildinformers "github.com/pivotal/kpack/pkg/client/informers/externalversions/build/v1alpha2"
 	buildlisters "github.com/pivotal/kpack/pkg/client/listers/build/v1alpha2"
 	"github.com/pivotal/kpack/pkg/reconciler"
+	"github.com/pivotal/kpack/pkg/reconciler/status"
 	"github.com/pivotal/kpack/pkg/registry"
 )
 
@@ -131,17 +130,7 @@ func (c *Reconciler) reconcileClusterStackStatus(ctx context.Context, clusterSta
 }
 
 func (c *Reconciler) updateClusterStackStatus(ctx context.Context, desired *buildapi.ClusterStack) error {
-	desired.Status.ObservedGeneration = desired.Generation
-
-	original, err := c.ClusterStackLister.Get(desired.Name)
-	if err != nil {
-		return err
-	}
-
-	if equality.Semantic.DeepEqual(desired.Status, original.Status) {
-		return nil
-	}
-
-	_, err = c.Client.KpackV1alpha2().ClusterStacks().UpdateStatus(ctx, desired, metav1.UpdateOptions{})
+	_, err := status.NewClusterStackWriterFor(c.Client, c.ClusterStackLister, desired.Name).
+		Write(ctx, desired)
 	return err
 }

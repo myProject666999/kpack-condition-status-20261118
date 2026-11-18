@@ -10,7 +10,6 @@ import (
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +30,7 @@ import (
 	"github.com/pivotal/kpack/pkg/cnb"
 	"github.com/pivotal/kpack/pkg/config"
 	"github.com/pivotal/kpack/pkg/reconciler"
+	"github.com/pivotal/kpack/pkg/reconciler/status"
 	"github.com/pivotal/kpack/pkg/registry"
 	"github.com/pivotal/kpack/pkg/secret"
 	"github.com/pivotal/kpack/pkg/slsa"
@@ -360,17 +360,8 @@ func buildStepCompleted(s *corev1.ContainerStatus) bool {
 }
 
 func (c *Reconciler) updateStatus(ctx context.Context, desired *buildapi.Build) error {
-	desired.Status.ObservedGeneration = desired.Generation
-	original, err := c.Lister.Builds(desired.Namespace).Get(desired.Name)
-	if err != nil {
-		return err
-	}
-
-	if equality.Semantic.DeepEqual(original.Status, desired.Status) {
-		return nil
-	}
-
-	_, err = c.Client.KpackV1alpha2().Builds(desired.Namespace).UpdateStatus(ctx, desired, metav1.UpdateOptions{})
+	_, err := status.NewBuildWriterFor(c.Client, c.Lister, desired.Name, desired.Namespace).
+		Write(ctx, desired)
 	return err
 }
 

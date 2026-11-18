@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +48,7 @@ func testImageReconciler(t *testing.T, when spec.G, it spec.S) {
 		originalGeneration     int64 = 1
 	)
 	fakeTracker := &testhelpers.FakeTracker{}
+	conflictReactors := make([]clientgotesting.ReactionFunc, 0)
 
 	rt := testhelpers.ReconcilerTester(t,
 		func(t *testing.T, row *rtesting.TableRow) (reconciler controller.Reconciler, lists rtesting.ActionRecorderList, list rtesting.EventList) {
@@ -54,6 +56,10 @@ func testImageReconciler(t *testing.T, when spec.G, it spec.S) {
 
 			fakeClient := fake.NewSimpleClientset(listers.BuildServiceObjects()...)
 			k8sfakeClient := k8sfake.NewSimpleClientset(listers.GetKubeObjects()...)
+
+			for _, reactor := range conflictReactors {
+				fakeClient.PrependReactor("update", "images", reactor)
+			}
 
 			eventRecorder := record.NewFakeRecorder(10)
 			actionRecorderList := rtesting.ActionRecorderList{fakeClient, k8sfakeClient}
@@ -2753,6 +2759,174 @@ func testImageReconciler(t *testing.T, when spec.G, it spec.S) {
 						},
 					},
 				})
+			})
+
+			it("summarizes the failed build when the builder is also not ready", func() {
+				imageWithBuilder.Status.BuildCounter = 1
+				failureMessage := "something went wrong"
+				sourceResolver := resolvedSourceResolver(imageWithBuilder)
+				failedBuild := &buildapi.Build{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      fmt.Sprintf("%s-build-%d", imageWithBuilder.Name, 1),
+						Namespace: imageWithBuilder.Namespace,
+						OwnerReferences: []metav1.OwnerReference{
+							*kmeta.NewControllerRef(imageWithBuilder),
+						},
+						Labels: map[string]string{
+							buildapi.BuildNumberLabel: "1",
+							buildapi.ImageLabel:       imageWithBuilder.Name,
+						},
+					},
+					Spec: buildapi.BuildSpec{
+						Tags: []string{imageWithBuilder.Spec.Tag},
+						Source: corev1alpha1.SourceConfig{
+							Git: &corev1alpha1.Git{
+								URL:      sourceResolver.Status.Source.Git.URL,
+								Revision: sourceResolver.Status.Source.Git.Revision,
+							},
+						},
+					},
+					Status: buildapi.BuildStatus{
+						Status: corev1alpha1.Status{
+							Conditions: corev1alpha1.Conditions{
+								{
+									Type:    corev1alpha1.ConditionSucceeded,
+									Status:  corev1.ConditionFalse,
+									Message: failureMessage,
+								},
+							},
+						},
+					},
+				}
+
+				rt.Test(rtesting.TableRow{
+					Key: key,
+					Objects: runtimeObjects(
+						[]runtime.Object{failedBuild},
+						imageWithBuilder,
+						builderWithCondition(
+							builder,
+							corev1alpha1.Condition{
+								Type:    corev1alpha1.ConditionReady,
+								Status:  corev1.ConditionFalse,
+								Message: "something went wrong",
+							},
+							corev1alpha1.Condition{
+								Type:   buildapi.ConditionUpToDate,
+								Status: corev1.ConditionFalse,
+							},
+						),
+						sourceResolver,
+					),
+					WantErr: false,
+					WantStatusUpdates: []clientgotesting.UpdateActionImpl{
+						{
+							Object: &buildapi.Image{
+								ObjectMeta: imageWithBuilder.ObjectMeta,
+								Spec:       imageWithBuilder.Spec,
+								Status: buildapi.ImageStatus{
+									Status: corev1alpha1.Status{
+										ObservedGeneration: originalGeneration,
+										Conditions: corev1alpha1.Conditions{
+											{
+												Type:   corev1alpha1.ConditionReady,
+												Status: corev1.ConditionFalse,
+												Reason: buildapi.BuilderNotReady,
+												Message: "Error: Builder 'builder-name' is not ready in namespace 'some-namespace'; Message: something went wrong" +
+													"; Additional: Succeeded: Error: Build 'image-name-build-1' in namespace 'some-namespace' failed: something went wrong",
+											},
+											{
+												Type:    buildapi.ConditionBuilderReady,
+												Status:  corev1.ConditionFalse,
+												Reason:  buildapi.BuilderNotReady,
+												Message: "Error: Builder 'builder-name' is not ready in namespace 'some-namespace'; Message: something went wrong",
+											},
+											{
+												Type:    buildapi.ConditionBuilderUpToDate,
+												Status:  corev1.ConditionFalse,
+												Reason:  buildapi.BuilderNotUpToDate,
+												Message: "Builder is not up to date. The latest stack and buildpacks may not be in use.",
+											},
+										},
+									},
+									LatestBuildRef: "image-name-build-1",
+									BuildCounter:   1,
+								},
+							},
+						},
+					},
+				})
+			})
+
+			it("retries status writes on conflict until the update succeeds", func() {
+				sourceResolver := resolvedSourceResolver(imageWithBuilder)
+				conflictCount := 0
+
+				conflictReactors = append(conflictReactors, func(action clientgotesting.Action) (bool, runtime.Object, error) {
+					if _, ok := action.(clientgotesting.UpdateAction); !ok {
+						return false, nil, nil
+					}
+					conflictCount++
+					if conflictCount <= 2 {
+						return true, nil, k8serrors.NewConflict(
+							schema.GroupResource{Resource: "images"}, imageName, assert.AnError)
+					}
+					return false, nil, nil
+				})
+				defer func() { conflictReactors = nil }()
+
+				expectedStatus := &buildapi.Image{
+					ObjectMeta: imageWithBuilder.ObjectMeta,
+					Spec:       imageWithBuilder.Spec,
+					Status: buildapi.ImageStatus{
+						Status: corev1alpha1.Status{
+							ObservedGeneration: originalGeneration,
+							Conditions: corev1alpha1.Conditions{
+								{
+									Type:   corev1alpha1.ConditionReady,
+									Status: corev1.ConditionTrue,
+									Reason: image.UpToDateReason,
+								},
+								{
+									Type:   buildapi.ConditionBuilderReady,
+									Status: corev1.ConditionTrue,
+									Reason: buildapi.BuilderReady,
+								},
+								{
+									Type:   buildapi.ConditionBuilderUpToDate,
+									Status: corev1.ConditionTrue,
+									Reason: buildapi.BuilderUpToDate,
+								},
+							},
+						},
+						LatestBuildRef:             "image-name-build-1",
+						LatestBuildReason:          "",
+						LatestBuildImageGeneration: 0,
+						LatestImage:                "some/image@sha256:build-1",
+						LatestStack:                "io.buildpacks.stacks.bionic",
+						BuildCounter:               1,
+					},
+				}
+
+				rt.Test(rtesting.TableRow{
+					Key: key,
+					Objects: runtimeObjects(
+						successfulBuilds(imageWithBuilder, sourceResolver, 1),
+						imageWithBuilder,
+						builder,
+						sourceResolver,
+					),
+					WantErr: false,
+					// The writer retries after each conflict; the framework
+					// records every attempt and the desired object is identical.
+					WantStatusUpdates: []clientgotesting.UpdateActionImpl{
+						{Object: expectedStatus},
+						{Object: expectedStatus},
+						{Object: expectedStatus},
+					},
+				})
+
+				assert.Equal(t, 3, conflictCount, "two conflicts followed by a successful retry")
 			})
 
 			when("reconciling old builds", func() {

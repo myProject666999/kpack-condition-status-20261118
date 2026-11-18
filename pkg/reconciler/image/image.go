@@ -27,6 +27,7 @@ import (
 	buildlisters "github.com/pivotal/kpack/pkg/client/listers/build/v1alpha2"
 	"github.com/pivotal/kpack/pkg/duckbuilder"
 	"github.com/pivotal/kpack/pkg/reconciler"
+	"github.com/pivotal/kpack/pkg/reconciler/status"
 	"github.com/pivotal/kpack/pkg/tracker"
 )
 
@@ -285,17 +286,8 @@ func (c *Reconciler) fetchLastBuild(image *buildapi.Image) (*buildapi.Build, err
 }
 
 func (c *Reconciler) updateStatus(ctx context.Context, desired *buildapi.Image) error {
-	desired.Status.ObservedGeneration = desired.Generation
-	original, err := c.ImageLister.Images(desired.Namespace).Get(desired.Name)
-	if err != nil {
-		return err
-	}
-
-	if equality.Semantic.DeepEqual(original.Status, desired.Status) {
-		return nil
-	}
-
-	_, err = c.Client.KpackV1alpha2().Images(desired.Namespace).UpdateStatus(ctx, desired, metav1.UpdateOptions{})
+	_, err := status.NewImageWriterFor(c.Client, c.ImageLister, desired.Name, desired.Namespace).
+		Write(ctx, desired)
 	return err
 }
 

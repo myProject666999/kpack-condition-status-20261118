@@ -16,7 +16,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/pkg/errors"
-	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/cache"
 	"knative.dev/pkg/controller"
@@ -28,6 +27,7 @@ import (
 	buildlisters "github.com/pivotal/kpack/pkg/client/listers/build/v1alpha2"
 	"github.com/pivotal/kpack/pkg/cnb"
 	"github.com/pivotal/kpack/pkg/reconciler"
+	"github.com/pivotal/kpack/pkg/reconciler/status"
 	"github.com/pivotal/kpack/pkg/registry"
 	"github.com/pivotal/kpack/pkg/tracker"
 )
@@ -305,18 +305,8 @@ func (c *Reconciler) reconcileBuilder(ctx context.Context, builder *buildapi.Clu
 }
 
 func (c *Reconciler) updateStatus(ctx context.Context, desired *buildapi.ClusterBuilder) error {
-	desired.Status.ObservedGeneration = desired.Generation
-
-	original, err := c.ClusterBuilderLister.Get(desired.Name)
-	if err != nil {
-		return err
-	}
-
-	if equality.Semantic.DeepEqual(desired.Status, original.Status) {
-		return nil
-	}
-
-	_, err = c.Client.KpackV1alpha2().ClusterBuilders().UpdateStatus(ctx, desired, metav1.UpdateOptions{})
+	_, err := status.NewClusterBuilderWriterFor(c.Client, c.ClusterBuilderLister, desired.Name).
+		Write(ctx, desired)
 	return err
 }
 

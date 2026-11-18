@@ -107,8 +107,82 @@ func noScheduledBuild(buildNeeded corev1.ConditionStatus, builder buildapi.Build
 		ready.Message = fmt.Sprintf("Error: Build '%s' in namespace '%s' failed: %s", build.Name, build.Namespace, defaultMessageIfNil(build.Status.GetCondition(corev1alpha1.ConditionSucceeded), "unknown error"))
 	}
 
-	return corev1alpha1.Conditions{ready, builderReadyCondition(builder), builderUpToDateCondition(builder)}
+	builderReady := builderReadyCondition(builder)
+	builderUpToDate := builderUpToDateCondition(builder)
 
+	// The build-side outcome participates in the aggregation through a
+	// transient Succeeded condition; it is never persisted as an Image status
+	// condition. BuilderReady outranks it, preserving the historical
+	// precedence where a not-ready builder always supplies the Ready reason.
+	buildSucceeded := buildSucceededCondition(build, ready.Status, ready.Reason, ready.Message)
+	ready = aggregateImageReady(ready, corev1alpha1.Conditions{builderReady, buildSucceeded})
+
+	return corev1alpha1.Conditions{ready, builderReady, builderUpToDate}
+
+}
+
+// imageAggregationConfig ranks BuilderReady above the build outcome.
+// BuilderUpToDate is a hint and never affects Ready.
+var imageAggregationConfig = corev1alpha1.AggregationConfig{
+	TopType:  corev1alpha1.ConditionReady,
+	Required: []corev1alpha1.ConditionType{buildapi.ConditionBuilderReady, corev1alpha1.ConditionSucceeded},
+	Hints:    []corev1alpha1.ConditionType{buildapi.ConditionBuilderUpToDate},
+}
+
+// buildFailureMessage renders the last build's own failure detail
+// independently of which branch the Ready switch took. It lets the
+// aggregation summarize the build-side cause even when the builder failure
+// wins the top-level reason.
+func buildFailureMessage(build *buildapi.Build) string {
+	if build == nil {
+		return "unknown error"
+	}
+	return fmt.Sprintf("Error: Build '%s' in namespace '%s' failed: %s",
+		build.Name, build.Namespace,
+		defaultMessageIfNil(build.Status.GetCondition(corev1alpha1.ConditionSucceeded), "unknown error"))
+}
+
+// buildSucceededCondition mirrors the build-side state that the existing
+// switch already derived for Ready. It feeds the aggregator without changing
+// any reason or message strings.
+func buildSucceededCondition(build *buildapi.Build, readyStatus corev1.ConditionStatus, reason, message string) corev1alpha1.Condition {
+	var succeeded *corev1alpha1.Condition
+	if build != nil {
+		succeeded = build.Status.GetCondition(corev1alpha1.ConditionSucceeded)
+	}
+
+	condition := corev1alpha1.Condition{
+		Type:    corev1alpha1.ConditionSucceeded,
+		Status:  unknownStatusIfNil(succeeded),
+		Reason:  reason,
+		Message: message,
+	}
+
+	// A successful last build is represented as True so aggregation agrees
+	// with the Ready=True branch above.
+	if readyStatus == corev1.ConditionTrue {
+		condition.Status = corev1.ConditionTrue
+	}
+
+	// When the build itself failed, its own failure detail is the meaningful
+	// sub-cause to surface in the aggregated summary.
+	if succeeded.IsFalse() {
+		condition.Message = buildFailureMessage(build)
+	}
+	return condition
+}
+
+// aggregateImageReady lets the shared aggregator make the False decision
+// (including the stable multi-cause summary). True and Unknown outcomes keep
+// the base condition produced by the existing switch, so their reason and
+// message are byte-identical to the previous behavior.
+func aggregateImageReady(base corev1alpha1.Condition, subConditions corev1alpha1.Conditions) corev1alpha1.Condition {
+	aggregated := corev1alpha1.AggregateCondition(subConditions, imageAggregationConfig)
+	if aggregated.Status == corev1.ConditionFalse {
+		aggregated.LastTransitionTime = base.LastTransitionTime
+		return aggregated
+	}
+	return base
 }
 
 func unknownStatusIfNil(condition *corev1alpha1.Condition) corev1.ConditionStatus {

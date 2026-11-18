@@ -5,9 +5,7 @@ import (
 	"errors"
 
 	"go.uber.org/zap"
-	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 	"knative.dev/pkg/controller"
 	"knative.dev/pkg/logging/logkey"
@@ -19,6 +17,7 @@ import (
 	buildlisters "github.com/pivotal/kpack/pkg/client/listers/build/v1alpha2"
 	"github.com/pivotal/kpack/pkg/config"
 	"github.com/pivotal/kpack/pkg/reconciler"
+	"github.com/pivotal/kpack/pkg/reconciler/status"
 )
 
 const (
@@ -142,11 +141,8 @@ func (c *Reconciler) updateStatus(ctx context.Context, desired *buildapi.SourceR
 		c.retainCommitIfTreeUnchanged(original.Status, &desired.Status)
 	}
 
-	if equality.Semantic.DeepEqual(original.Status, desired.Status) {
-		return nil
-	}
-
-	_, err = c.Client.KpackV1alpha2().SourceResolvers(desired.Namespace).UpdateStatus(ctx, desired, v1.UpdateOptions{})
+	_, err = status.NewSourceResolverWriterFor(c.Client, c.SourceResolverLister, desired.Name, desired.Namespace).
+		Write(ctx, desired)
 	return err
 }
 
